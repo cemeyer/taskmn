@@ -1,0 +1,227 @@
+Taskmn is an M:N userspace:kernel cooperative threading library built on top
+of Russ Cox's libtask.
+
+First of all: please DO NOT actually use this. It will bring you headache upon
+headache, and is a poor solution to a problem that doesn't exist. This is
+mostly just going on the internet for reference.
+
+Much of the code is derived from libtask, which has various MIT- and BSD-
+licensed bits.
+
+Any significant changes I have made are released under the terms of the MIT
+license. Do what you will with it (but again, seriously, don't use it).
+
+Additionally: This was originally built to work on our hacked-up FreeBSD-
+derived OS; I've quickly hacked it up so it at least compiles on Linux now
+(althought we may have lost FreeBSD in the process, whatever). Expect
+everything to be broken.
+
+--Conrad
+
+=============================================================================
+
+This is a very hacked-up libtask for M:N userspace threading. We've nuked the
+print crap, the channels, 'system' tasks, and support for non-x86 architectures.
+
+We have added the concept of a libtask context, to allow for multiple instances
+per process. However, this shouldn't be necessary because libtaskmn manages a
+threadpool. Instead of taskmain(), we have:
+
+int     libtaskmn(void (*f)(Task *, void *arg), void *arg, int nthr);
+
+This function is documented in taskmn.h.
+
+libtaskmn will log to syslog at LOG_DEBUG level if you open a log for it and
+set the environment variable TASKMN_SPAM. Its messages will be prefixed
+"=lt=" (this was mostly for my use in debugging).
+
+=======================================================================
+The original README has also been hacked up. Here it is in its Shelley-
+inspired glory:
+=======================================================================
+
+Libtaskmn is a threadpool library. It should compile and limp along on most x86
+and amd64 Unixes (Linux included).
+
+Libtaskmn gives the programmer the illusion of infinite (to the limits of
+memory) threads, but these are actually running on a limited-size
+threadpool. For clarity, we refer to the coroutines as "tasks," not
+threads, but the programmer should keep in mind that they may run
+concurrently.
+
+Scheduling is somewhat cooperative. If the number of live tasks is greater
+than the size of the threadpool, some tasks will be wait to run. Many
+functions provided in taskmn.h can yield the thread to another task;
+these should be documented below. Programs using taskmn should
+#include <taskmn.h>.
+
+--- Basic task manipulation
+
+int taskcreate(Task *, void (*f)(Task*, void *arg), void *arg);
+
+	Create a new task running f(arg); returns the task id.
+
+void taskexit(Task *, int status);
+
+	Exit the current task. If this is the last task, taskmn exits
+
+int taskyield(Task *);
+	
+	Explicitly give up the CPU. The current task will be scheduled
+	again once all the other currently-ready tasks have a chance
+	to run. Returns the number of other tasks that ran while the
+	current task was waiting. (Zero means there are no other tasks
+	trying to run.)
+
+int taskdelay(Task *, unsigned int ms)
+
+	Explicitly give up the CPU for at least ms milliseconds. Other tasks
+    continue to run during this time. Returns the number of milliseconds
+    elapsed.
+
+void** taskdata(Task *);
+
+	Return a pointer to a single per-task void* pointer.
+	You can use this as a per-task storage place.
+
+void taskname(Task *, char*, ...);
+
+	Sets the current task's name; uses sprintf under the covers. Max of
+    256 characters.
+	
+char* taskgetname(Task *);
+
+	Returns the current task's name. The buffer is owned by taskmn and
+    should not be freed by the caller.
+	
+void taskstate(Task *, char*, ...);
+char* taskgetstate(Task *);
+
+	Like taskname and taskgetname but for the task state. Unlike taskname,
+    taskstate is set by taskmn itself in many places, so keep that in
+    mind.
+
+unsigned int taskid(Task *);
+
+	Return the unique task id for the current task.
+
+void taskpoolsize(Task *, int);
+
+    Sets the size of the task pool (number of threads).
+
+--- Non-blocking I/O
+
+There is a small amount of runtime support for non-blocking I/O
+on file descriptors. Keep in mind that on unix, file I/O will block
+regardless of O_NONBLOCK on the fd. Therefore, these are only really
+useful for socket/pipe IO.
+
+Tasks blocked on non-block IO will only resume when the set of live
+tasks has quiesced such that at least one thread in the threadpool
+is idle. (This behavior is inherited from libtask.)
+
+int fdnoblock(int fd);
+
+	Sets I/O on the given fd to be non-blocking. Returns -1 on error,
+    setting errno. See fcntl(2), but I think the only error should be
+    EBADF. Should be called before any of the following fd routines.
+
+ssize_t fdread(Task *, int, void*, int);
+
+	Like regular read(), but puts task to sleep on EAGAIN instead of
+    blocking the whole program.
+
+    fdread1() is similar, but puts the task to sleep first.
+
+ssize_t fdwrite(Task *, int, void*, int);
+
+	Like regular write(), but puts task to sleep on EAGAIN (i.e., the
+    outgoing socket buffer or the pipe buffer is full).
+
+void fdwait(Task *, int fd, char rw);
+
+	Low-level call sitting underneath fdread and fdwrite.
+	Puts task to sleep while waiting for I/O to be possible on fd.
+	Rw specifies type of I/O: 'r' means read, 'w' means write,
+	anything else means just exceptional conditions (hang up, etc.)
+	The 'r' and 'w' also wake up for exceptional conditions.
+
+--- Network I/O
+
+These are convenient packaging of the ugly Unix socket routines.
+They can all put the current task to sleep during the call.  
+
+int netannounce(Task *, int proto, char *address, int port)
+
+	Start a network listener running on address and port of protocol.
+	Proto is either TCP or UDP. Port is a port number.  Address is a
+	string version of a host name or IP address. If address is null or
+    "*", then announce binds to the given port on all available
+    interfaces. Returns an fd to use with netaccept.
+
+    On error, returns -1, setting errno. taskstate() will show which
+    step failed.
+
+	Examples: netannounce(TCP, "localhost", 80) or 
+		netannounce(TCP, "127.0.0.1", 80) or netannounce(TCP, 0, 80).
+
+int netaccept(Task *, int fd, char *server, int *port)
+
+	Get the next connection that comes in to the listener fd.
+	Returns an fd to use to talk to the client who just connected.
+
+    Server is filled with the remote IP and must be big enough
+    to contain it; or, it can be null.
+
+	Port is filled in with the remote port; or, it can be null.
+
+    Returns an fd, or -1 on error. See accept(2) for sources of error.
+
+	Example:
+		char server[16];
+		int port;
+		
+		if(netaccept(fd, server, &port) >= 0)
+			printf("connect from %s:%d", server, port);
+
+int netdial(Task *, int proto, char *name, int port)
+
+	Create a new (outgoing) connection to a particular host.
+	Name can be an ip address or a domain name.
+
+    Returns an fd or -1 on error; see taskstate and errno for
+    error source.
+
+	Example: netdial(TCP, "www.google.com", 80)
+		or netdial(TCP, "18.26.4.9", 80)
+
+--- Time
+
+unsigned taskdelay(Task *, unsigned ms)
+
+	Put the current task to sleep for approximately ms milliseconds.
+	Return the actual amount of time slept, in milliseconds.
+
+--- Example programs
+
+We have inherited some example programs from upstream libtask, but we've
+changed the API somewhat and haven't verified that they're still
+function. They may be educational anyway; see the demo/ directory.
+
+--- Yielding condition variables ---
+
+void rendezinit(Rendez *);
+
+void tasksleep(Task *, Rendez *r);
+int taskwakeup(Task *, Rendez *r);
+int taskwakeupall(Task *, Rendez *r);
+
+	A Rendez is a condition variable. You initialize it with rendezinit()
+    but you don't need to do anything special to clean it up.
+
+    tasksleep() blocks the running task on r until woken by taskwakeup()
+    or taskwakeupall(). (It is the typical CV "wait" primitive.)
+
+    taskwakeup() wakes the first task sleeping on r, if any ("signal" or
+    "notify"). taskwakeupall() wakes all tasks sleeping on r, if any
+    ("notifyall"). Both return the number of tasks woken.
